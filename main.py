@@ -1,28 +1,78 @@
-# enjoy and have fun skidding
+"""
+main.py — Roblox FFlag injector via direct memory manipulation.
+Reads flag definitions from fflags.json and writes them into a running
+RobloxPlayerBeta.exe process using the NtDll memory layer.
+"""
 
 import json
-import requests
+import logging
 import os
+import re
 import sys
 from collections import OrderedDict
 from typing import Dict, Optional, Tuple
-from core.memory import memoryman, closehandle
 
-def getthemagicoffset():
-    try:
-        response = requests.get("https://npdrlaufeimrkvdnjijl.supabase.co/functions/v1/get-offsets", timeout=10) # using imtheo cuz idc
-        if response.status_code == 200:
-            import re
-            match = re.search(r"Pointer\s*=\s*(0x[0-9a-fA-F]+)", response.text)
-            if match:
-                return int(match.group(1), 16)
-    except:
-        pass
-    return 0x7ce33d8 # default you can change this 
+import requests
 
-theoffsetmagic = getthemagicoffset()
+from core.memory import MemoryManager, close_handle, AttachTimeoutError
 
-thebanner = r"""
+log = logging.getLogger(__name__)
+
+# ──────────────────────────────────────────────
+# Constants — FFlag map layout
+# ──────────────────────────────────────────────
+
+OFF_FFLAG_VALUE_PTR  = 0xC0   # offset inside FFlag getset struct → value ptr
+
+OFF_MAP_END          = 0x00
+OFF_MAP_LIST         = 0x10
+OFF_MAP_MASK         = 0x28
+
+OFF_ENTRY_FORWARD    = 0x08
+OFF_ENTRY_STRING     = 0x10
+OFF_ENTRY_GETSET     = 0x30
+
+OFF_STR_BYTES        = 0x00
+OFF_STR_SIZE         = 0x10
+OFF_STR_CAPACITY     = 0x18
+
+# ──────────────────────────────────────────────
+# Constants — traversal limits / tuning
+# ──────────────────────────────────────────────
+
+NODE_READ_SIZE   = 64
+NODE_STRIDES     = [64, 72, 56, 80, 88, 96]
+MAX_CHAIN_STEPS  = 128
+MAX_CHAIN_SAFETY = 1_000
+MIN_VALID_PTR    = 0x10_000
+FLAG_ADDR_LRU_MAX = 4_096
+
+# ──────────────────────────────────────────────
+# Constants — FNV-1a hashing
+# ──────────────────────────────────────────────
+
+FNV1A_64_BASIS = 0xCBF29CE484222325
+FNV1A_64_PRIME = 0x100000001B3
+
+# ──────────────────────────────────────────────
+# Constants — process targets
+# ──────────────────────────────────────────────
+
+ROBLOX_EXE = "RobloxPlayerBeta.exe"
+
+OFFSETS_URL     = "https://npdrlaufeimrkvdnjijl.supabase.co/functions/v1/get-offsets"
+OFFSETS_PATTERN = re.compile(r"Pointer\s*=\s*(0x[0-9a-fA-F]+)")
+DEFAULT_OFFSET  = 0x7CE33D8
+
+# ──────────────────────────────────────────────
+# FFlag type prefixes
+# ──────────────────────────────────────────────
+
+STRING_PREFIXES = ("FString", "DFString")
+INT_PREFIXES    = ("DFInt", "FInt", "DFLog", "FLog")
+BOOL_PREFIXES   = ("DFFlag", "FFlag")
+
+BANNER = r"""
 ██╗   ██╗███████╗██╗      ██████╗ ██████╗ ██╗███╗   ██╗
 ██║   ██║██╔════╝██║     ██╔═══██╗██╔══██╗██║████╗  ██║
 ██║   ██║█████╗  ██║     ██║   ██║██████╔╝██║██╔██╗ ██║
@@ -31,396 +81,428 @@ thebanner = r"""
   ╚═══╝  ╚══════╝╚══════╝ ╚═════╝ ╚═╝  ╚═╝╚═╝╚═╝  ╚═══╝
 """
 
-mbasis = 0xcbf29ce484222325
-mprime = 0x100000001b3
-mbasisalt = 0x811c9dc5
-mprimealt = 0x01000193
 
-offfflagvalueptr = 0xc0
-offmapend = 0x00
-offmaplist = 0x10
-offmapmask = 0x28
-offentryforward = 0x08
-offentrystring = 0x10
-offentrygetset = 0x30
-offstrbytes = 0x00
-offstrsize = 0x10
-offstralloc = 0x18
-offstrcapacity = 0x18
+# ──────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────
 
-nodereadsize = 64
-nodestrides = [64, 72, 56, 80, 88, 96]
-maxchainsteps = 128
-maxchainsafety = 1000
-minvalidptr = 0x10000
-flagaddrlrumax = 4096
+def fetch_flag_list_offset() -> int:
+    """Try to fetch the current FFlagList pointer offset from the remote endpoint.
 
-class therobbloxhacker:
-    def __init__(self):
-        self.memory = memoryman()
-        self.mem = self.memory.mem
-        self.processhandle = None
-        self.modulebase = 0
-        self.modulesize = 0
-        self.cachedsingleton = 0
-        self.hashcache: Dict[str, int] = {}
-        self.lookupmetacache: Dict[str, Dict[str, int]] = {}
-        self.valueptrlru: OrderedDict[str, int] = OrderedDict()
-        self.cachemapidentity: Tuple[int, int, int] = (0, 0, 0)
-        self.attachingandfuckingroblox()
+    Falls back to DEFAULT_OFFSET on any error.
+    """
+    try:
+        resp = requests.get(OFFSETS_URL, timeout=10)
+        if resp.status_code == 200:
+            m = OFFSETS_PATTERN.search(resp.text)
+            if m:
+                offset = int(m.group(1), 16)
+                log.debug("Fetched offset from remote: 0x%X", offset)
+                return offset
+    except Exception as exc:
+        log.debug("Could not fetch remote offset: %s", exc)
+    log.debug("Using default offset: 0x%X", DEFAULT_OFFSET)
+    return DEFAULT_OFFSET
 
-    def cachevalueptr(self, name: str, valueptr: int) -> None:
-        if not valueptr:
-            return
-        self.valueptrlru[name] = valueptr
-        self.valueptrlru.move_to_end(name)
-        while len(self.valueptrlru) > flagaddrlrumax:
-            self.valueptrlru.popitem(last=False)
 
-    def getcachedvalueptr(self, name: str) -> int:
-        valueptr = self.valueptrlru.get(name)
-        if valueptr:
-            self.valueptrlru.move_to_end(name)
-            return valueptr
-        return 0
+def get_base_path() -> str:
+    """Return the directory that contains the executable (or this script)."""
+    if getattr(sys, "frozen", False) or hasattr(sys, "real_path"):
+        return os.path.dirname(os.path.realpath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
 
-    def isvalidptr(self, ptr: int) -> bool:
-        return isinstance(ptr, int) and minvalidptr <= ptr <= 0x7FFFFFFFFFFF
 
-    def fnv1a64(self, name: str) -> int:
-        cached = self.hashcache.get(name)
+def parse_flag_type(key: str) -> Tuple[str, str]:
+    """Derive the clean flag name and its type (string / int / bool) from *key*.
+
+    Returns *(clean_name, type_str)*.
+    """
+    for prefix in STRING_PREFIXES:
+        if key.startswith(prefix):
+            return key[len(prefix):], "string"
+
+    for prefix in INT_PREFIXES:
+        if key.startswith(prefix):
+            return key[len(prefix):], "int"
+
+    for prefix in BOOL_PREFIXES:
+        if key.startswith(prefix):
+            return key[len(prefix):], "bool"
+
+    # Unknown prefix — default to int (same behaviour as original)
+    return key, "int"
+
+
+# ──────────────────────────────────────────────
+# Core injector
+# ──────────────────────────────────────────────
+
+class FlagInjector:
+    """
+    Locates and patches Roblox FFlags in memory.
+
+    Call :meth:`apply_json` to read a JSON file and write all flags,
+    then :meth:`cleanup` to release the process handle.
+    """
+
+    def __init__(self, flag_list_offset: int) -> None:
+        self._flag_list_offset = flag_list_offset
+
+        self._mm = MemoryManager()
+        self._mem = self._mm.mem
+
+        self._process_handle: int = 0
+        self._module_base:    int = 0
+        self._module_size:    int = 0
+
+        # Caches
+        self._singleton_addr:  int = 0
+        self._hash_cache:      Dict[str, int] = {}
+        self._lookup_meta:     Dict[str, Dict[str, int]] = {}
+        self._value_ptr_lru:   OrderedDict[str, int] = OrderedDict()
+        self._map_identity:    Tuple[int, int, int] = (0, 0, 0)
+
+        self._attach()
+
+    # ── attach ─────────────────────────────────
+
+    def _attach(self) -> None:
+        print("[ + ] Waiting for Roblox …")
+        self._process_handle, self._module_base, self._module_size = (
+            self._mm.attach(ROBLOX_EXE, ROBLOX_EXE)
+        )
+        print(f"[ + ] Attached  handle=0x{self._process_handle:X}")
+        print(f"[ + ] Module    base=0x{self._module_base:X}  size=0x{self._module_size:X}")
+
+    # ── ptr validation ─────────────────────────
+
+    @staticmethod
+    def _is_valid_ptr(ptr: int) -> bool:
+        return isinstance(ptr, int) and MIN_VALID_PTR <= ptr <= 0x7FFF_FFFF_FFFF
+
+    # ── FNV-1a 64 ──────────────────────────────
+
+    def _fnv1a64(self, name: str) -> int:
+        cached = self._hash_cache.get(name)
         if cached is not None:
             return cached
 
-        basis = mbasis
-        prime = mprime
+        h = FNV1A_64_BASIS
         for byte in name.encode("utf-8", errors="ignore"):
-            basis ^= byte
-            basis = (basis * prime) & 0xFFFFFFFFFFFFFFFF
+            h ^= byte
+            h = (h * FNV1A_64_PRIME) & 0xFFFF_FFFF_FFFF_FFFF
 
-        self.hashcache[name] = basis
-        return basis
+        self._hash_cache[name] = h
+        return h
 
-    def invalidatelookupcaches(self, clearhash: bool = False) -> None:
-        self.lookupmetacache.clear()
-        self.valueptrlru.clear()
-        if clearhash:
-            self.hashcache.clear()
+    # ── cache helpers ──────────────────────────
 
-    def readentrynamebytes(self, entrydata: bytes) -> Tuple[bytes, int]:
-        strdatastart = offentrystring
-        strsize = int.from_bytes(
-            entrydata[strdatastart + offstrsize:strdatastart + offstrsize + 8],
-            "little",
-        )
-        if strsize <= 0 or strsize > 256:
-            return b"", 0
+    def _cache_value_ptr(self, name: str, ptr: int) -> None:
+        if not ptr:
+            return
+        self._value_ptr_lru[name] = ptr
+        self._value_ptr_lru.move_to_end(name)
+        while len(self._value_ptr_lru) > FLAG_ADDR_LRU_MAX:
+            self._value_ptr_lru.popitem(last=False)
 
-        stralloc = int.from_bytes(
-            entrydata[strdatastart + offstrcapacity:strdatastart + offstrcapacity + 8],
-            "little",
-        )
-
-        if stralloc > 0xF:
-            ptr = int.from_bytes(entrydata[strdatastart:strdatastart + 8], "little")
-            if not self.isvalidptr(ptr):
-                return b"", 0
-            namebytes = self.mem.readmemory(self.processhandle, ptr, strsize)
-            if not namebytes:
-                return b"", 0
-            return namebytes[:strsize], strsize
-
-        return entrydata[strdatastart:strdatastart + strsize], strsize
-
-    def readnodeentry(self, nodeptr: int) -> Optional[bytes]:
-        if not self.isvalidptr(nodeptr):
-            return None
-
-        for readsize in nodestrides:
-            if readsize < nodereadsize:
-                continue
-            entrydata = self.mem.readmemory(self.processhandle, nodeptr, readsize)
-            if entrydata and len(entrydata) >= nodereadsize:
-                return entrydata
-        return None
-
-    def attachingandfuckingroblox(self):
-        print("[ + ] roblox not found huh looking for it ")
-        self.processhandle, self.modulebase, self.modulesize = self.memory.attachprocess(
-            "RobloxPlayerBeta.exe",
-            "RobloxPlayerBeta.exe",
-        )
-        print(f"[ + ] Attached to handle: 0x{self.processhandle:X}")
-        print(f"[ + ] Module Base: 0x{self.modulebase:X}")
-        print(f"[ + ] Module Size: 0x{self.modulesize:X}")
-
-    def getsingleton(self) -> int:
-        if self.cachedsingleton:
-            return self.cachedsingleton
-
-        print("[ + ] reading FFlagList offset")
-        addr = self.modulebase + theoffsetmagic
-        
-        absolute = self.mem.readint64(self.processhandle, addr)
-        
-        if absolute and absolute > 0:
-            self.cachedsingleton = absolute
-            print(f"[ + ] Singleton (FFlagList) found at: 0x{absolute:X} (from offset 0x{theoffsetmagic:X})")
-            return absolute
-        
-        print("[ - ] Failed to read FFlagList rip .")
+    def _get_cached_value_ptr(self, name: str) -> int:
+        ptr = self._value_ptr_lru.get(name)
+        if ptr:
+            self._value_ptr_lru.move_to_end(name)
+            return ptr
         return 0
 
-    def whereistheflagat(self, name: str) -> int:
-        valueptr = self.getcachedvalueptr(name)
-        if valueptr:
-            return valueptr
+    def _invalidate_caches(self, clear_hash: bool = False) -> None:
+        self._lookup_meta.clear()
+        self._value_ptr_lru.clear()
+        if clear_hash:
+            self._hash_cache.clear()
 
-        singleton = self.getsingleton()
+    # ── node/entry reading ─────────────────────
+
+    def _read_entry_name(self, entry_data: bytes) -> Tuple[bytes, int]:
+        base = OFF_ENTRY_STRING
+
+        str_size = int.from_bytes(
+            entry_data[base + OFF_STR_SIZE: base + OFF_STR_SIZE + 8], "little"
+        )
+        if not (0 < str_size <= 256):
+            return b"", 0
+
+        str_alloc = int.from_bytes(
+            entry_data[base + OFF_STR_CAPACITY: base + OFF_STR_CAPACITY + 8], "little"
+        )
+
+        if str_alloc > 0xF:
+            # Heap-allocated string — dereference the pointer
+            ptr = int.from_bytes(entry_data[base: base + 8], "little")
+            if not self._is_valid_ptr(ptr):
+                return b"", 0
+            name_bytes = self._mem.read(self._process_handle, ptr, str_size)
+            return (name_bytes[:str_size] if name_bytes else b""), str_size
+
+        # SSO (small string optimisation) — inline bytes
+        return entry_data[base: base + str_size], str_size
+
+    def _read_node_entry(self, node_ptr: int) -> Optional[bytes]:
+        if not self._is_valid_ptr(node_ptr):
+            return None
+
+        for stride in NODE_STRIDES:
+            if stride < NODE_READ_SIZE:
+                continue
+            try:
+                data = self._mem.read(self._process_handle, node_ptr, stride)
+            except Exception:
+                continue
+            if len(data) >= NODE_READ_SIZE:
+                return data
+
+        return None
+
+    # ── singleton (FFlagList) ──────────────────
+
+    def _get_singleton(self) -> int:
+        if self._singleton_addr:
+            return self._singleton_addr
+
+        addr = self._module_base + self._flag_list_offset
+        try:
+            absolute = self._mem.read_u64(self._process_handle, addr)
+        except Exception:
+            absolute = 0
+
+        if absolute > 0:
+            self._singleton_addr = absolute
+            print(f"[ + ] FFlagList at 0x{absolute:X}  (offset 0x{self._flag_list_offset:X})")
+            return absolute
+
+        print("[ - ] Failed to locate FFlagList.")
+        return 0
+
+    # ── flag address lookup ────────────────────
+
+    def _find_flag_addr(self, name: str) -> int:
+        """Locate the getset pointer for flag *name*.  Returns 0 on failure."""
+        cached = self._get_cached_value_ptr(name)
+        if cached:
+            return cached
+
+        singleton = self._get_singleton()
         if not singleton:
             return 0
 
-        namebytes = name.encode("utf-8")
-        hashmapaddr = singleton + 8
+        name_bytes   = name.encode("utf-8")
+        hashmap_addr = singleton + 8
 
-        mapbytes = self.mem.readmemory(self.processhandle, hashmapaddr, 56)
-        if not mapbytes:
+        try:
+            map_data = self._mem.read(self._process_handle, hashmap_addr, 56)
+        except Exception:
             return 0
 
-        mapend = int.from_bytes(mapbytes[offmapend:offmapend+8], 'little')
-        maplist = int.from_bytes(mapbytes[offmaplist:offmaplist+8], 'little')
-        mapmask = int.from_bytes(mapbytes[offmapmask:offmapmask+8], 'little')
-        mapidentity = (maplist, mapend, mapmask)
+        map_end  = int.from_bytes(map_data[OFF_MAP_END:  OFF_MAP_END  + 8], "little")
+        map_list = int.from_bytes(map_data[OFF_MAP_LIST: OFF_MAP_LIST + 8], "little")
+        map_mask = int.from_bytes(map_data[OFF_MAP_MASK: OFF_MAP_MASK + 8], "little")
 
-        if mapmask == 0 or maplist == 0 or not self.isvalidptr(maplist):
-            return 0
-        if mapidentity != self.cachemapidentity:
-            self.invalidatelookupcaches(clearhash=False)
-            self.cachemapidentity = mapidentity
-
-        meta = self.lookupmetacache.get(name, {})
-        if "bucketindex" in meta:
-            bucketindex = meta["bucketindex"]
-        else:
-            basis = self.fnv1a64(name)
-            bucketindex = basis & mapmask
-        bucketindex &= mapmask
-        bucketbase = maplist + (bucketindex * 16)
-
-        bucketdata = self.mem.readmemory(self.processhandle, bucketbase, 16)
-        if not bucketdata:
+        if not map_mask or not map_list or not self._is_valid_ptr(map_list):
             return 0
 
-        nodecurrent = int.from_bytes(bucketdata[8:16], 'little')
-        if not self.isvalidptr(nodecurrent):
+        identity = (map_list, map_end, map_mask)
+        if identity != self._map_identity:
+            self._invalidate_caches(clear_hash=False)
+            self._map_identity = identity
+
+        meta = self._lookup_meta.get(name, {})
+
+        bucket_index = meta.get("bucketindex", self._fnv1a64(name) & map_mask) & map_mask
+        bucket_base  = map_list + (bucket_index * 16)
+
+        try:
+            bucket_data = self._mem.read(self._process_handle, bucket_base, 16)
+        except Exception:
             return 0
 
-        if nodecurrent == mapend:
+        node_current = int.from_bytes(bucket_data[8:16], "little")
+        if not self._is_valid_ptr(node_current) or node_current == map_end:
             return 0
 
-        cachednode = meta.get("nodeptr", 0)
-        if cachednode and self.isvalidptr(cachednode):
-            entrydata = self.readnodeentry(cachednode)
-            if entrydata:
-                entrynamebytes, entrylen = self.readentrynamebytes(entrydata)
-                if entrylen == len(namebytes) and entrynamebytes == namebytes:
-                    getset = int.from_bytes(entrydata[offentrygetset:offentrygetset+8], 'little')
-                    if self.isvalidptr(getset):
-                        self.lookupmetacache[name] = {
-                            "bucketindex": bucketindex,
-                            "nodeptr": cachednode,
-                        }
-                        self.cachevalueptr(name, getset)
+        # Fast path — check cached node first
+        cached_node = meta.get("nodeptr", 0)
+        if cached_node and self._is_valid_ptr(cached_node):
+            entry = self._read_node_entry(cached_node)
+            if entry:
+                entry_name, entry_len = self._read_entry_name(entry)
+                if entry_len == len(name_bytes) and entry_name == name_bytes:
+                    getset = int.from_bytes(entry[OFF_ENTRY_GETSET: OFF_ENTRY_GETSET + 8], "little")
+                    if self._is_valid_ptr(getset):
+                        self._lookup_meta[name] = {"bucketindex": bucket_index, "nodeptr": cached_node}
+                        self._cache_value_ptr(name, getset)
                         return getset
 
-        iterations = 0
-        safe = 0
-        visited = set()
+        # Walk the chain
+        visited  = set()
+        steps    = 0
+        safety   = 0
 
-        while iterations < maxchainsteps and safe < maxchainsafety:
-            iterations += 1
-            safe += 1
-            if nodecurrent in visited:
+        while steps < MAX_CHAIN_STEPS and safety < MAX_CHAIN_SAFETY:
+            steps  += 1
+            safety += 1
+
+            if node_current in visited:
                 break
-            visited.add(nodecurrent)
+            visited.add(node_current)
 
-            entrydata = self.readnodeentry(nodecurrent)
-            if not entrydata:
-                break
-
-            forward = int.from_bytes(entrydata[offentryforward:offentryforward+8], 'little')
-            if forward and not self.isvalidptr(forward):
+            entry = self._read_node_entry(node_current)
+            if not entry:
                 break
 
-            entrynamebytes, entrylen = self.readentrynamebytes(entrydata)
-            if entrylen == len(namebytes) and entrynamebytes == namebytes:
-                getset = int.from_bytes(entrydata[offentrygetset:offentrygetset+8], 'little')
-                if self.isvalidptr(getset):
-                    self.lookupmetacache[name] = {
-                        "bucketindex": bucketindex,
-                        "nodeptr": nodecurrent,
-                    }
-                    self.cachevalueptr(name, getset)
+            forward = int.from_bytes(entry[OFF_ENTRY_FORWARD: OFF_ENTRY_FORWARD + 8], "little")
+            if forward and not self._is_valid_ptr(forward):
+                break
+
+            entry_name, entry_len = self._read_entry_name(entry)
+            if entry_len == len(name_bytes) and entry_name == name_bytes:
+                getset = int.from_bytes(entry[OFF_ENTRY_GETSET: OFF_ENTRY_GETSET + 8], "little")
+                if self._is_valid_ptr(getset):
+                    self._lookup_meta[name] = {"bucketindex": bucket_index, "nodeptr": node_current}
+                    self._cache_value_ptr(name, getset)
                     return getset
 
-            if nodecurrent == forward or forward == 0:
+            if not forward or node_current == forward:
                 break
-
-            nodecurrent = forward
+            node_current = forward
 
         return 0
 
-    def changesthetext(self, name: str, value: str) -> bool:
-        addr = self.whereistheflagat(name)
+    # ── flag writers ───────────────────────────
+
+    def _write_string(self, name: str, value: str) -> bool:
+        addr = self._find_flag_addr(name)
         if not addr:
             return False
-
         try:
-            return self.memory.writeflagstring(self.processhandle, addr, offfflagvalueptr, value)
-        except Exception:
+            self._mm.write_fflag_string(self._process_handle, addr, OFF_FFLAG_VALUE_PTR, value)
+            return True
+        except Exception as exc:
+            log.debug("write_string %r failed: %s", name, exc)
             return False
 
-    def changesthenumber(self, name: str, value: int) -> bool:
-        addr = self.whereistheflagat(name)
+    def _write_int(self, name: str, value: int) -> bool:
+        addr = self._find_flag_addr(name)
         if not addr:
             return False
-        
         try:
-            return self.memory.writeflagint(self.processhandle, addr, offfflagvalueptr, value)
-        except:
+            self._mm.write_fflag_int(self._process_handle, addr, OFF_FFLAG_VALUE_PTR, value)
+            return True
+        except Exception as exc:
+            log.debug("write_int %r failed: %s", name, exc)
             return False
 
-    def themainfunctionlol(self, key: str) -> Tuple[str, str]:
-        if key.startswith("FString"):
-            return key[7:], "string"
-        elif key.startswith("DFString"):
-            return key[8:], "string"
-        
-        elif key.startswith("DFInt"):
-            return key[5:], "int"
-        elif key.startswith("FInt"):
-            return key[4:], "int"
-        elif key.startswith("DFLog"):
-            return key[5:], "int"
-        elif key.startswith("FLog"):
-            return key[4:], "int"
-        
-        elif key.startswith("DFFlag"):
-            return key[6:], "bool"
-        elif key.startswith("FFlag"):
-            return key[5:], "bool"
-        
-        else:
-            if any(keyword in key.lower() for keyword in ['fahh']):
-                return key, "bool"
-            else:
-                return key, "int"
+    # ── public API ─────────────────────────────
 
-    def doitnow(self, key: str, val) -> Tuple[bool, str]:
-        cleanname, flagtype = self.themainfunctionlol(key)
+    def apply_flag(self, key: str, val) -> Tuple[bool, str]:
+        """Write a single FFlag.  Returns *(success, status_message)*."""
+        clean_name, flag_type = parse_flag_type(key)
 
         try:
-            if flagtype == "string":
-                if self.changesthetext(cleanname, str(val)):
-                    return True, f"[ + ] {key} = \"{val}\""
-                else:
-                    return False, f"[ - ] Failed: {key}"
+            if flag_type == "string":
+                ok = self._write_string(clean_name, str(val))
+                return (ok, f'[ + ] {key} = "{val}"') if ok else (False, f"[ - ] Failed: {key}")
 
-            elif flagtype == "int":
+            if flag_type == "int":
                 try:
-                    targetvalue = int(val)
-                except:
-                    return False, f"[ - ] Invalid int: {key}"
-                
-                if self.changesthenumber(cleanname, targetvalue):
-                    return True, f"[ + ] {key} = {targetvalue}"
-                else:
-                    return False, f"[ - ] Failed: {key}"
+                    int_val = int(val)
+                except (TypeError, ValueError):
+                    return False, f"[ - ] Invalid int for {key}: {val!r}"
+                ok = self._write_int(clean_name, int_val)
+                return (ok, f"[ + ] {key} = {int_val}") if ok else (False, f"[ - ] Failed: {key}")
 
-            elif flagtype == "bool":
+            if flag_type == "bool":
                 if isinstance(val, bool):
-                    targetvalue = 1 if val else 0
+                    bool_val = val
                 else:
-                    targetvalue = 1 if str(val).lower() == "true" else 0
-                
-                if self.changesthenumber(cleanname, targetvalue):
-                    return True, f"[ + ] {key} = {bool(targetvalue)}"
-                else:
-                    return False, f"[ - ] Failed: {key}"
+                    bool_val = str(val).lower() == "true"
+                ok = self._write_int(clean_name, int(bool_val))
+                return (ok, f"[ + ] {key} = {bool_val}") if ok else (False, f"[ - ] Failed: {key}")
 
-            else:
-                return False, f"[ - ] Unknown type: {key}"
-        except Exception as e:
-            return False, f"[ - ] Error {key}: {str(e)}"
+        except Exception as exc:
+            return False, f"[ - ] Error {key}: {exc}"
 
-    def puttheflagsinthere(self, jsonpath: str):
-        if not os.path.exists(jsonpath):
-            print(f"[ - ] Error: File '{jsonpath}' not found!")
+        return False, f"[ - ] Unknown flag type for: {key}"
+
+    def apply_json(self, json_path: str) -> None:
+        """Read *json_path* and apply every flag it defines."""
+        if not os.path.exists(json_path):
+            print(f"[ - ] File not found: {json_path}")
             return
 
-        print(f"[ + ] Loading flags from: {jsonpath}")
+        print(f"[ + ] Loading flags from: {json_path}")
 
         try:
-            with open(jsonpath, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-        except json.JSONDecodeError as e:
-            print(f"[ - ] Error parsing JSON: {e}")
+            with open(json_path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except json.JSONDecodeError as exc:
+            print(f"[ - ] JSON parse error: {exc}")
             return
-        except Exception as e:
-            print(f"[ - ] Error reading file: {e}")
+        except OSError as exc:
+            print(f"[ - ] Could not read file: {exc}")
             return
 
-        totalflags = len(data)
-        successful = 0
-        failed = 0
+        total   = len(data)
+        success = 0
 
         for key, val in data.items():
-            success, message = self.doitnow(key, val)
-            print(message)
-            
-            if success:
-                successful += 1
-            else:
-                failed += 1
+            ok, msg = self.apply_flag(key, val)
+            print(msg)
+            success += ok
 
-        print(f"Applied: {successful}/{totalflags}")
+        print(f"\n[ + ] Applied {success}/{total} flags.")
 
-    def cleanup(self):
-        self.invalidatelookupcaches(clearhash=True)
-        if self.processhandle:
-            closehandle(self.processhandle)
+    def cleanup(self) -> None:
+        """Release the process handle and clear all caches."""
+        self._invalidate_caches(clear_hash=True)
+        if self._process_handle:
+            close_handle(self._process_handle)
+            self._process_handle = 0
 
-def getbasepath():
-    if getattr(sys, 'frozen', False) or hasattr(sys, 'real_path'):
-        return os.path.dirname(os.path.realpath(sys.executable))
-    
-    return os.path.dirname(os.path.abspath(__file__))
 
-def main():
-    print(thebanner)
-    print("[ + ] Velorin FFlag Injector - discord.gg/F8kkN62Apk \n")
+# ──────────────────────────────────────────────
+# Entry point
+# ──────────────────────────────────────────────
+
+def main() -> None:
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
+
+    print(BANNER)
+    print("[ + ] Velorin FFlag Injector — discord.gg/F8kkN62Apk\n")
+
+    offset   = fetch_flag_list_offset()
+    injector = None
 
     try:
-        fflags = therobbloxhacker()
+        injector = FlagInjector(flag_list_offset=offset)
 
-        exedir = getbasepath()
-        jsonpath = os.path.join(exedir, "fflags.json")
+        base_dir  = get_base_path()
+        json_path = os.path.join(base_dir, "fflags.json")
 
-        print(f"[ + ] Looking for fflags.json in: {jsonpath}")
+        print(f"[ + ] Looking for fflags.json in: {base_dir}")
 
-        if not os.path.exists(jsonpath):
-            print("[ - ] Error: fflags.json not found!")
-            print(f"    Please place 'fflags.json' in: {exedir}")
+        if not os.path.exists(json_path):
+            print("[ - ] fflags.json not found.")
+            print(f"      Place it in: {base_dir}")
         else:
-            print(f"[ + ] Found fflags.json")
-            fflags.puttheflagsinthere(jsonpath)
+            injector.apply_json(json_path)
 
-        fflags.cleanup()
+    except AttachTimeoutError as exc:
+        print(f"\n[ - ] Attach timed out: {exc}")
+    except Exception as exc:
+        print(f"\n[ - ] Unexpected error: {exc}")
+        log.exception("Unhandled exception in main")
+    finally:
+        if injector is not None:
+            injector.cleanup()
 
-    except Exception as e:
-        print(f"\n[ - ] poop: {e}")
-
-    print("\n[ + ] done now press enter to exit bye bye")
+    print("\n[ + ] Done. Press Enter to exit …")
     input()
 
 
